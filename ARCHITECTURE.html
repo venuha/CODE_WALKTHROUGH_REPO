@@ -1540,7 +1540,91 @@ WHERE USER_NAME = 'reviewer_1' AND ROLE = 'user';
   <!-- ===== SECTION 13: SCALING ===== -->
   <h2 id="scaling">17. Scaling &amp; Enterprise Considerations</h2>
 
-  <h3>"How would this change for 50 enterprise tenants?"</h3>
+  <h3>Customer Discovery &amp; Engagement Framework (How I Start Any Agent Project)</h3>
+  <div class="card">
+    <p>Before writing a single line of code, I run a structured discovery process. This is how I approached the census project — and how I'd approach any client engagement:</p>
+
+    <h4>Step 1: Understand Business Objective</h4>
+    <table>
+      <thead><tr><th>Question</th><th>Census Project Answer</th><th>Why It Matters</th></tr></thead>
+      <tbody>
+        <tr><td>What problem are we solving?</td><td>"Make ACS census data accessible to non-technical users via natural language"</td><td>Determines agent complexity. Simple Q&amp;A vs multi-step workflow vs decision support.</td></tr>
+        <tr><td>What's the business value?</td><td>Policy researchers get answers in seconds instead of writing SQL or hiring analysts</td><td>Defines success — if researchers still can't get answers, we failed regardless of tech quality.</td></tr>
+        <tr><td>What exists today?</td><td>Raw coded tables on Snowflake Marketplace (71 tables, cryptic column names)</td><td>Starting point. Do we build from scratch or augment existing tools?</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Step 2: Identify Users &amp; Their Questions</h4>
+    <table>
+      <thead><tr><th>User Persona</th><th>Typical Questions</th><th>Skill Level</th></tr></thead>
+      <tbody>
+        <tr><td>Policy researcher</td><td>"Which states have the highest poverty rates?" / "How does education correlate with income?"</td><td>Domain expert, no SQL knowledge</td></tr>
+        <tr><td>Data journalist</td><td>"What's the racial breakdown in Texas?" / "Compare California vs Florida demographics"</td><td>Knows data, can't write complex JOINs</td></tr>
+        <tr><td>Government analyst</td><td>"SNAP participation rate by state" / "Uninsured population under 19"</td><td>Knows exact metrics, wants fast answers</td></tr>
+        <tr><td>Student/educator</td><td>"What is the total population?" / "How many veterans are there?"</td><td>Basic questions, needs context and explanations</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Action:</strong> These personas shaped my response instructions (lead with insight, plain language) and skill file (definitions for non-experts).</p>
+
+    <h4>Step 3: Assess Available Data &amp; Quality</h4>
+    <pre>
+What I did for census data:
+1. Explored all 71 tables in US_OPEN_CENSUSDATA.PUBLIC
+2. Discovered: all tables use coded columns (B01001e1, B01001e2...)
+3. Found: metadata table maps codes to human-readable labels
+4. Validated: ~220,000 block groups, 50 states + DC + PR, ACS 2019 5-year
+5. Data quality checks:
+   - Are there NULLs? → Yes, but NULL = "total" (valid, not missing)
+   - Are there zeros? → Yes, valid (e.g., no Asian pop in rural block group)
+   - Completeness? → Full coverage across all states/territories
+   - Freshness? → 2019 vintage, static (no streaming needed)
+    </pre>
+    <p><strong>CoCo skills used:</strong> <code>sql-author</code> for exploration queries, <code>snowflake-sql-execute</code> for running validation checks against live data.</p>
+
+    <h4>Step 4: Real-Time vs Batch Decision</h4>
+    <table>
+      <thead><tr><th>Factor</th><th>Assessment</th><th>Decision</th></tr></thead>
+      <tbody>
+        <tr><td>Data freshness needs</td><td>ACS data is released annually (static vintage)</td><td><strong>Batch</strong> — no streaming, no real-time ingest needed</td></tr>
+        <tr><td>Query latency needs</td><td>Users expect answers in &lt;60s, not milliseconds</td><td><strong>On-demand compute</strong> — query at request time, no pre-materialization required</td></tr>
+        <tr><td>Data volume</td><td>~220K block groups × 24 views = manageable for on-the-fly aggregation</td><td><strong>Views over raw tables</strong> — no ETL pipeline, no staging tables</td></tr>
+        <tr><td>Update frequency</td><td>Once per year (new ACS vintage)</td><td><strong>Manual refresh</strong> — update views when new data lands on Marketplace</td></tr>
+      </tbody>
+    </table>
+    <p><strong>If this were real-time data</strong> (e.g., IoT sensors, transaction feeds): I'd use Dynamic Tables or Streams + Tasks for incremental refresh, and possibly pre-aggregated materialized views for sub-second dashboards.</p>
+
+    <h4>Step 5: Define Success Metrics (Before Building)</h4>
+    <table>
+      <thead><tr><th>Metric</th><th>Target</th><th>How We'll Measure</th></tr></thead>
+      <tbody>
+        <tr><td>Query accuracy</td><td>&gt;85% correct answers</td><td>sql_correctness evaluation against golden dataset</td></tr>
+        <tr><td>Topic coverage</td><td>All 24 ACS domains answerable</td><td>1+ VQR per domain passing evaluation</td></tr>
+        <tr><td>Response time</td><td>&lt;60s for 90% of queries</td><td>Latency tracking from observability logs</td></tr>
+        <tr><td>Guardrail effectiveness</td><td>100% rejection of off-topic/adversarial</td><td>Automated guardrail test suite</td></tr>
+        <tr><td>User can self-serve</td><td>No SQL knowledge required</td><td>Test with non-technical users</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Step 6: Build MVP → Observe → Tune</h4>
+    <pre>
+MVP (what I built):
+  → 24 semantic views covering all ACS domains
+  → Agent with orchestration + response instructions
+  → Basic Streamlit UI for testing
+  → Evaluated with 40-question golden dataset
+
+POST-MVP (iterative tuning based on real usage):
+  → Monitor: which questions fail? which timeout?
+  → Tune: add VQRs for failing patterns
+  → Expand: add county-level if users request it
+  → Merge: consolidate SVs that cause routing confusion
+  → Observe: AI_SUMMARIZE_AGG on failed queries weekly → identify gaps
+  → Personalize: build user personas from CHAT_HISTORY over time
+
+Key principle: Don't over-engineer upfront. Build the data layer right (hardest to change),
+keep agent/UI thin (easy to iterate), then tune based on REAL user behavior, not assumptions.
+    </pre>
+  </div>
   <div class="card">
     <ul>
       <li><strong>Multi-tenancy via RBAC:</strong> Each tenant gets a role. Row access policies on views filter by TENANT_ID. Same agent, same views, different data visibility.</li>
