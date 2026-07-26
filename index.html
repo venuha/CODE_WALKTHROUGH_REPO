@@ -1576,6 +1576,77 @@ WHERE USER_NAME = 'reviewer_1' AND ROLE = 'user';
     <p><strong>Sprint cadence:</strong> 2-week sprints. Sprint 1: core data + agent working. Sprint 2: evaluation + UI polish. Sprint 3: hardening + observability + tenant customization.</p>
   </div>
 
+  <h3>How I Would Actually Run This as a Technical Program</h3>
+  <div class="card">
+    <p>Before any code is written, I would run a structured planning phase:</p>
+
+    <h4>Phase 0: Requirements &amp; Architecture (Week 1)</h4>
+    <table>
+      <thead><tr><th>Activity</th><th>Owner</th><th>Output</th></tr></thead>
+      <tbody>
+        <tr><td>Evaluate requirements with stakeholder</td><td>Me (Tech Lead)</td><td>Scope document: what questions must the agent answer, what data exists, who are the users</td></tr>
+        <tr><td>High-level architecture design</td><td>Me</td><td>Architecture diagram: data flow, component inventory, deployment model, security boundaries</td></tr>
+        <tr><td>Infrastructure &amp; security deep-dive</td><td>Me + Infra Engineer</td><td>Decision: internal (SPCS) vs external (K8s), auth model (SSO, PAT, OAuth), network policies</td></tr>
+        <tr><td>Data exploration &amp; mining task assignment</td><td>Data Engineer</td><td>Source table inventory, schema understanding, coded column mapping, quality assessment</td></tr>
+        <tr><td>UI/UX wireframes &amp; design</td><td>Frontend Engineer</td><td>Mockups: chat interface, topic cards, sidebar nav, dark/light theme spec</td></tr>
+        <tr><td>Evaluation metrics plan</td><td>AI/ML Engineer</td><td>Golden dataset design, metric selection (sql_correctness, TSA, latency), baseline targets</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Key Decision: Internal vs External Agent Deployment</h4>
+    <table>
+      <thead><tr><th>Scenario</th><th>Deployment</th><th>Auth Model</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Internal agent</strong> (employees only)</td><td>SPCS (Snowpark Container Services)</td><td>Snowflake SSO + RBAC</td><td>Stays inside Snowflake's perimeter. No external hosting. No K8s cluster to manage. FastAPI + React in a container, or SiS for simpler needs.</td></tr>
+        <tr><td><strong>External agent</strong> (customers/partners)</td><td>K8s / Cloud Run / ECS</td><td>OAuth 2.0 / SAML + Snowflake External OAuth</td><td>Need public-facing URL, rate limiting, customer-specific auth flows, SLA guarantees outside Snowflake's control plane.</td></tr>
+        <tr><td><strong>Hybrid</strong> (internal + partner access)</td><td>SPCS + API Gateway (AWS/Azure)</td><td>Internal: SSO, External: OAuth + API keys</td><td>Core runs in SPCS, API gateway handles external auth and rate limiting.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>For this project:</strong> I chose SiS (internal-only, simplest) because it's a demo/evaluation context. For a client engagement, I would evaluate their infra stack first and recommend SPCS for internal or K8s/Cloud Run for external based on their existing platform.</p>
+
+    <h4>ML Prediction Layer (Future Enhancement)</h4>
+    <p>The current agent is <strong>descriptive</strong> (what happened). Adding prediction power would make it <strong>predictive</strong> (what will happen):</p>
+    <table>
+      <thead><tr><th>Capability</th><th>How</th><th>Snowflake Feature</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Population growth forecast</strong></td><td>Time-series model trained on historical ACS vintages (2010, 2015, 2019)</td><td>Snowflake ML Forecasting (Cortex ML)</td></tr>
+        <tr><td><strong>Poverty risk prediction</strong></td><td>Classification model: which block groups are at risk of increasing poverty</td><td>Snowflake ML Classification</td></tr>
+        <tr><td><strong>Anomaly detection</strong></td><td>Flag block groups with unusual demographic shifts vs neighbors</td><td>Snowflake ML Anomaly Detection</td></tr>
+        <tr><td><strong>Clustering</strong></td><td>Group states/counties by socioeconomic similarity ("which states are most like Mississippi?")</td><td>Snowflake ML (or custom model via Model Registry)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Integration approach:</strong> Add prediction models as <strong>custom tools</strong> (stored procedures) in the agent spec. User asks "Will poverty increase in Mississippi?" → Agent calls the forecasting tool → returns prediction with confidence interval. The agent becomes both a reporting tool AND a decision-support tool.</p>
+    <pre>
+-- Example: Add a forecasting tool to the agent
+"tools": [
+  ... existing 24 Cortex Analyst tools ...,
+  {
+    "tool_spec": {
+      "type": "stored_procedure",
+      "name": "predict_poverty_trend",
+      "description": "Predicts poverty rate trends for a state using ML forecasting model.
+        Use when user asks about future trends, predictions, or forecasts.",
+      "procedure": "CENSUS_INTELLIGENCE_DB.PUBLIC.PREDICT_POVERTY_TREND",
+      "arguments": [{"name": "state_code", "type": "VARCHAR"}]
+    }
+  }
+]
+    </pre>
+
+    <h4>Evaluation Metrics Plan (What I'd Assign to ML Engineer)</h4>
+    <table>
+      <thead><tr><th>Metric</th><th>Target</th><th>How Measured</th><th>Action if Below</th></tr></thead>
+      <tbody>
+        <tr><td>Tool Selection Accuracy</td><td>&gt;90%</td><td>EXECUTE_AI_EVALUATION, 100+ questions</td><td>Improve tool descriptions, add REJECT hints, merge confusing SVs</td></tr>
+        <tr><td>SQL Correctness</td><td>&gt;85%</td><td>sql_correctness metric, VQRs as ground truth</td><td>Add ai_sql_generation hints, expand VQRs for failing patterns</td></tr>
+        <tr><td>Response Latency P95</td><td>&lt;45s</td><td>Query history + observability logs</td><td>Pre-aggregate views, add clustering keys, merge SVs</td></tr>
+        <tr><td>Timeout Rate</td><td>&lt;5%</td><td>Count of queries exceeding 60s budget</td><td>Identify slow paths, add VQRs for complex patterns</td></tr>
+        <tr><td>Guardrail Effectiveness</td><td>100% rejection of adversarial inputs</td><td>Automated adversarial test suite (50+ cases)</td><td>Strengthen orchestration instructions, add keyword patterns</td></tr>
+        <tr><td>User Satisfaction</td><td>&gt;80% positive</td><td>Thumbs up/down on responses</td><td>Prioritize VQR additions for low-rated topics</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- ===== SECTION 18: HONEST SELF-ASSESSMENT ===== -->
   <h2 id="self-assessment">18. Honest Self-Assessment (What I'm Not Fully Satisfied With)</h2>
 
