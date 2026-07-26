@@ -1544,6 +1544,71 @@ WHERE USER_NAME = 'reviewer_1' AND ROLE = 'user';
   <div class="card">
     <p>Before writing a single line of code, I run a structured discovery process. This is how I approached the census project — and how I'd approach any client engagement:</p>
 
+    <h4>Project Scoping: Business Workshop</h4>
+    <table>
+      <thead><tr><th>Activity</th><th>Output</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Requirements workshop</strong> with business stakeholders</td><td>Prioritized list of questions the agent must answer, data domains in scope, user personas</td><td>Aligns engineering effort with actual business need — prevents building features nobody uses</td></tr>
+        <tr><td><strong>Milestones &amp; deliverable commitment</strong></td><td>Timeline with checkpoints: Data layer done → Agent working → UI complete → Eval passing → Production</td><td>Stakeholders know when to expect demos; team knows what "done" looks like at each stage</td></tr>
+        <tr><td><strong>Customer demos cadence</strong></td><td>Demo every 2 weeks: show progress, gather feedback, course-correct early</td><td>Avoids building in isolation for 6 weeks then discovering requirements were misunderstood</td></tr>
+        <tr><td><strong>Definition of Done</strong></td><td>Explicit acceptance criteria: accuracy target met, latency under threshold, guardrails passing, user successfully self-serves without SQL</td><td>Prevents scope creep and "one more feature" syndrome</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Operations Planning (Day 2 Readiness)</h4>
+    <p>Production isn't just deployment — it's ongoing operations. I plan for Day 2 from Day 0:</p>
+    <table>
+      <thead><tr><th>Ops Concern</th><th>What We Monitor</th><th>Action When Triggered</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Monitoring</strong></td><td>Agent response latency, tool selection distribution, empty result rate, timeout rate</td><td>Dashboard with trend lines; page on-call if P95 latency exceeds 50s</td></tr>
+        <tr><td><strong>Logging</strong></td><td>Every agent invocation: question, tool selected, SQL generated, execution time, result row count</td><td>Feed into observability pipeline; weekly analysis of failure patterns</td></tr>
+        <tr><td><strong>Alerts</strong></td><td>Timeout rate &gt;10%, empty result rate &gt;20%, guardrail bypass detected</td><td>Snowflake Alert → Slack/PagerDuty → engineer investigates within SLA</td></tr>
+        <tr><td><strong>Cost dashboard</strong></td><td>Credits consumed per day/week by: agent orchestration, Analyst SQL gen, warehouse compute</td><td>Budget thresholds; alert if daily spend exceeds baseline by 2x</td></tr>
+        <tr><td><strong>Regression testing</strong></td><td>Run full eval suite on every semantic view change (CI/CD gate)</td><td>Block deployment if sql_correctness score drops below baseline</td></tr>
+        <tr><td><strong>Rollbacks</strong></td><td>Previous semantic view DDL stored in git; Time Travel on Snowflake objects</td><td>One command: <code>CREATE OR REPLACE SEMANTIC VIEW ... </code> from previous commit in git</td></tr>
+        <tr><td><strong>Agent degradation monitoring</strong></td><td>Weekly: compare current eval score to baseline. Monthly: re-run full 100+ question suite.</td><td>If accuracy drops &gt;5% from baseline → investigate which VQRs are failing → tune ai_sql_generation → re-deploy</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Success Metrics (What We Report to the Business)</h4>
+    <table>
+      <thead><tr><th>Metric Category</th><th>Metric</th><th>Target</th><th>Business Value</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3"><strong>Technical Quality</strong></td><td>Response Latency (P95)</td><td>&lt;45 seconds</td><td>Users don't abandon the tool waiting for answers</td></tr>
+        <tr><td>Tool Selection Accuracy</td><td>&gt;90%</td><td>Agent routes to the right data on first try</td></tr>
+        <tr><td>SQL Correctness</td><td>&gt;85%</td><td>Answers are factually correct — users can trust them</td></tr>
+        <tr><td rowspan="3"><strong>User Adoption</strong></td><td>Active users / week</td><td>Growing trend</td><td>People actually use it vs going back to manual SQL</td></tr>
+        <tr><td>Repeat usage rate</td><td>&gt;60% return within 7 days</td><td>Users find it valuable enough to come back</td></tr>
+        <tr><td>Questions per session</td><td>&gt;3 average</td><td>Users explore beyond the first question (engagement)</td></tr>
+        <tr><td rowspan="3"><strong>Business Impact</strong></td><td>Time saved per query</td><td>5-15 minutes vs manual SQL</td><td>Analyst productivity: answers in 30s instead of 15 min writing SQL</td></tr>
+        <tr><td>Analyst productivity gain</td><td>3-5x more questions answered/day</td><td>Same team handles more requests without hiring</td></tr>
+        <tr><td>Self-service rate</td><td>&gt;80% questions answered without escalation</td><td>Business users stop filing tickets to data team for simple queries</td></tr>
+      </tbody>
+    </table>
+
+    <h4>How I'd Present ROI to the Customer</h4>
+    <pre>
+Before Agent:
+  - Business user files a ticket to data team
+  - Data engineer writes SQL (15-30 min)
+  - Reviews, runs, formats results (15 min)
+  - Sends back to requester (email delay: hours to days)
+  - Total: 1-24 hours per question
+
+After Agent:
+  - Business user types question in natural language
+  - Gets answer with data table in 30 seconds
+  - Follows up immediately with "what about by county?"
+  - Total: 30 seconds per question
+
+ROI calculation:
+  - 50 data questions/week × 30 min saved each = 25 hours/week saved
+  - At $75/hour loaded cost = $1,875/week = ~$97K/year in analyst time
+  - Agent cost: ~$500-1000/month in Snowflake credits
+  - NET SAVINGS: ~$85K/year + faster decision-making + no backlog
+    </pre>
+  </div>
+
     <h4>Step 1: Understand Business Objective</h4>
     <table>
       <thead><tr><th>Question</th><th>Census Project Answer</th><th>Why It Matters</th></tr></thead>
