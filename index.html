@@ -1003,6 +1003,114 @@ User types: "yes"
       <tr><td>26-57</td><td>Session State Init</td><td>conversation_id, messages[], pending_question, theme, query_count, past_conversations</td><td>Survives reruns within same browser tab. <code>uuid4()[:8]</code> for unique conversation IDs. Loads last 5 past conversations from CHAT_HISTORY on startup.</td></tr>
       <tr><td>60-71</td><td><code>save_message()</code></td><td>INSERT into CHAT_HISTORY table</td><td>Persists every message. Escapes backslashes and quotes to prevent SQL injection in the INSERT.</td></tr>
       <tr><td>74-84</td><td><code>load_conversation()</code></td><td>SELECT from CHAT_HISTORY by conversation_id</td><td>Allows sidebar "Previous Chats" feature — click to reload any past conversation.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Deep Dive: Session State &amp; Conversation Persistence</h4>
+  <div class="card">
+    <p><strong>What is <code>st.session_state</code>?</strong> Streamlit reruns the ENTIRE script from top to bottom on every user interaction (button click, form submit, etc.). Without <code>session_state</code>, all variables would reset on every rerun. <code>session_state</code> is a dict that persists across reruns within the same browser tab.</p>
+
+    <h4>Each State Variable Explained</h4>
+    <table>
+      <thead><tr><th>Variable</th><th>Initial Value</th><th>Purpose</th><th>Example Runtime Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>conversation_id</code></td><td><code>str(uuid4())[:8]</code> → e.g., "a3f7b2c1"</td><td>Unique ID for this conversation session. Used as key in CHAT_HISTORY table.</td><td>"a3f7b2c1"</td></tr>
+        <tr><td><code>messages</code></td><td><code>[]</code></td><td>Full in-memory conversation. Each item: <code>{"role": "user"/"assistant", "content": "...", "tables": [...]}</code></td><td><code>[{"role":"user","content":"What is poverty rate?"}, {"role":"assistant","content":"Mississippi...","tables":[...]}]</code></td></tr>
+        <tr><td><code>pending_question</code></td><td><code>None</code></td><td>Set when user clicks a Quick Query button or topic card. On next rerun, processed as if typed.</td><td>"What are the top 10 states by population?"</td></tr>
+        <tr><td><code>theme</code></td><td><code>"dark"</code></td><td>Current theme. Toggled by sidebar button. Controls which CSS block is injected.</td><td>"dark" or "light"</td></tr>
+        <tr><td><code>query_count</code></td><td><code>0</code></td><td>Number of user questions this session. Displayed in sidebar metrics.</td><td>7</td></tr>
+        <tr><td><code>past_conversations</code></td><td>Loaded from DB on first run</td><td>Last 5 conversations by this user (from CHAT_HISTORY). Shown in sidebar for reload.</td><td><code>[{"id":"b4e2a1","first_q":"What is poverty...","count":4}]</code></td></tr>
+        <tr><td><code>user_name</code></td><td><code>CURRENT_USER()</code></td><td>Snowflake username. Used to filter CHAT_HISTORY to only this user's conversations.</td><td>"VENU" or "CENSUS_REVIEWER"</td></tr>
+      </tbody>
+    </table>
+
+    <h4>How Past Conversations Load (Startup Query)</h4>
+    <pre>
+-- Runs ONCE on first page load (when past_conversations not in session_state)
+-- Gets the current Snowflake user
+user = session.sql("SELECT CURRENT_USER()").collect()[0][0]  -- e.g., "CENSUS_REVIEWER"
+
+-- Finds their last 5 conversations (excluding current one)
+SELECT CONVERSATION_ID,
+       MIN(CONTENT) AS FIRST_Q,     -- first message = conversation "title"
+       COUNT(*) AS MSG_COUNT,         -- how many messages in that conversation
+       MAX(CREATED_AT) AS LAST_ACTIVE -- when was it last used
+FROM CENSUS_INTELLIGENCE_DB.PUBLIC.CHAT_HISTORY
+WHERE USER_NAME = 'CENSUS_REVIEWER'
+  AND ROLE = 'user'                   -- only user messages (not assistant responses)
+  AND CONVERSATION_ID != 'a3f7b2c1'  -- exclude current conversation
+GROUP BY CONVERSATION_ID
+ORDER BY LAST_ACTIVE DESC
+LIMIT 5;
+
+-- Returns something like:
+-- | CONVERSATION_ID | FIRST_Q                          | MSG_COUNT | LAST_ACTIVE         |
+-- | b4e2a1f9        | What is the poverty rate by s... | 6         | 2026-07-25 14:30:00 |
+-- | c7d3e2a0        | Which states have highest inc... | 4         | 2026-07-24 10:15:00 |
+
+-- Stored in session_state as:
+past_conversations = [
+    {"id": "b4e2a1f9", "first_q": "What is the poverty rate by s...", "count": 6},
+    {"id": "c7d3e2a0", "first_q": "Which states have highest inc...", "count": 4}
+]
+    </pre>
+
+    <h4>Full Message Lifecycle Example</h4>
+    <pre>
+=== User types: "What is the poverty rate by state?" and clicks Ask ===
+
+1. FORM SUBMIT triggers Streamlit rerun
+2. Script runs from top → session_state variables persist (not reset)
+3. user_input = "What is the poverty rate by state?"
+4. Append to messages:
+     st.session_state.messages = [
+       {"role": "user", "content": "What is the poverty rate by state?"}
+     ]
+5. save_message("user", "What is the poverty rate by state?")
+     → INSERT INTO CHAT_HISTORY (conversation_id='a3f7b2c1', user_name='VENU',
+        message_seq=0, role='user', content='What is the poverty rate by state?')
+6. Call agent → gets response
+7. Append to messages:
+     st.session_state.messages = [
+       {"role": "user", "content": "What is the poverty rate by state?"},
+       {"role": "assistant", "content": "Mississippi has the highest...", "tables": [...]}
+     ]
+8. save_message("assistant", "Mississippi has the highest...")
+     → INSERT INTO CHAT_HISTORY (conversation_id='a3f7b2c1', user_name='VENU',
+        message_seq=1, role='assistant', content='Mississippi has the highest...')
+9. st.experimental_rerun() → page re-renders with both messages visible
+
+=== User types: "What about California specifically?" ===
+
+10. Same flow. messages now has 4 items:
+      [user_q1, assistant_a1, user_q2, assistant_a2]
+11. But only LAST 4 are sent to agent (history trimming)
+12. Both new messages saved to CHAT_HISTORY with message_seq=2, 3
+
+=== User closes browser, comes back next day ===
+
+13. session_state is GONE (new browser session)
+14. Script runs fresh → conversation_id = new uuid
+15. past_conversations query finds yesterday's conversation in CHAT_HISTORY
+16. Sidebar shows: "💬 What is the poverty rate by s... (4)"
+17. User clicks it → load_conversation("a3f7b2c1"):
+      SELECT ROLE, CONTENT FROM CHAT_HISTORY
+      WHERE CONVERSATION_ID = 'a3f7b2c1' ORDER BY MESSAGE_SEQ
+18. Returns all 4 messages → loaded into st.session_state.messages
+19. Page re-renders showing the full previous conversation
+    </pre>
+
+    <h4>Why This Design (vs Alternatives)</h4>
+    <table>
+      <thead><tr><th>Alternative</th><th>Problem</th><th>My Solution</th></tr></thead>
+      <tbody>
+        <tr><td>Store only in session_state</td><td>Lost on page refresh, browser close</td><td>CHAT_HISTORY table gives database persistence</td></tr>
+        <tr><td>Store only in database</td><td>Slow (SQL query on every rerun to re-read messages)</td><td>session_state gives in-memory speed; DB is backup</td></tr>
+        <tr><td>Use cookies/localStorage</td><td>Not available in SiS sandbox</td><td>Snowflake table is the persistent store</td></tr>
+        <tr><td>Send full history to agent</td><td>20+ messages × tokens = blows 60s budget</td><td>Trim to last 4 + smart rewriting for context</td></tr>
+      </tbody>
+    </table>
+  </div>
       <tr><td>87-211</td><td>Theme CSS (DARK_THEME + LIGHT_THEME)</td><td>125 lines of custom CSS with <code>!important</code> overrides</td><td>Snowsight injects its own theme. Without <code>!important</code>, the dark theme doesn't apply. Covers: app background, sidebar, chat bubbles, inputs, dataframes, expanders, metrics, buttons.</td></tr>
       <tr><td>214</td><td>Apply Theme</td><td><code>st.markdown(CSS, unsafe_allow_html=True)</code></td><td>Injects the active theme's CSS. Toggleable via sidebar button.</td></tr>
       <tr><td>216-232</td><td>Topic Questions + Starter Topics</td><td>6 topic categories with icons, titles, descriptions</td><td>Welcome screen discoverability. Users see what's possible before typing.</td></tr>
