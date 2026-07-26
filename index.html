@@ -1010,43 +1010,156 @@ User types: "yes"
     </tbody>
   </table>
 
-  <h4>Example: What call_agent() Returns (Raw JSON Structure)</h4>
-  <pre>
-// session.sql("SELECT DATA_AGENT_RUN(...)") returns:
+  <h4>Deep Dive: call_agent() — Agent Response Parsing (Most Critical Code)</h4>
+  <div class="card">
+    <p>This is the core function that calls the agent and parses what comes back. Understanding this code requires understanding the agent's response format.</p>
+
+    <h4>Step 1: Build &amp; Escape the Payload</h4>
+    <pre>
+payload = json.dumps({"messages": messages})
+safe_payload = payload.replace("\\", "\\\\").replace("'", "''")
+    </pre>
+    <p><strong>Why escape?</strong> The payload goes inside a SQL string literal: <code>SELECT DATA_AGENT_RUN('...', '{payload}')</code>. If the user types a question with apostrophes ("What's the poverty rate?"), the <code>'</code> would break the SQL. <code>.replace("'", "''")</code> escapes single quotes for SQL. <code>.replace("\\", "\\\\")</code> escapes backslashes that could interfere with JSON inside SQL.</p>
+
+    <h4>Step 2: Call the Agent via SQL</h4>
+    <pre>
+result = session.sql(
+    f"SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN('{FULL_AGENT_NAME}', '{safe_payload}') AS response"
+).collect()
+
+raw_response = result[0]["RESPONSE"]
+parsed = json.loads(raw_response)
+    </pre>
+    <p><strong>What happens:</strong> <code>DATA_AGENT_RUN</code> is a Snowflake SQL function that invokes the agent synchronously. It returns a single row with one column (<code>RESPONSE</code>) containing a JSON string. We parse that JSON into a Python dict.</p>
+
+    <h4>Step 3: The Agent Response Structure</h4>
+    <p>The parsed JSON always has a <code>"content"</code> array. Each item has a <code>"type"</code> field. There are 3 possible types:</p>
+    <pre>
+// ACTUAL RESPONSE for "What is the poverty rate by state? Top 5."
 {
   "content": [
+    // TYPE 1: "text" — The agent's narrative answer
     {
       "type": "text",
-      "text": "Mississippi has the highest poverty rate at 19.7%, followed by Louisiana at 18.6%..."
+      "text": "Here are the states with the highest poverty rates based on 2019 ACS data:\n\n
+               1. **Mississippi** — 19.7%\n
+               2. **Louisiana** — 18.6%\n
+               3. **New Mexico** — 18.2%\n
+               4. **West Virginia** — 17.1%\n
+               5. **Arkansas** — 16.4%\n\n
+               These rates represent the percentage of the population living below the
+               federal poverty level. Would you like to see child poverty specifically?"
     },
+
+    // TYPE 2: "table" — Structured data with columns and rows
     {
       "type": "table",
       "table": {
-        "title": "Poverty Rate by State",
+        "title": "Top 5 States by Poverty Rate",
         "result_set": {
           "resultSetMetaData": {
             "rowType": [
-              {"name": "STATE"},
+              {"name": "STATE", "type": "TEXT"},
+              {"name": "BELOW_POVERTY", "type": "FIXED"},
+              {"name": "TOTAL_FOR_DETERMINATION", "type": "FIXED"},
               {"name": "POVERTY_RATE_PCT", "type": "REAL"}
             ]
           },
           "data": [
-            ["MS", 19.7],
-            ["LA", 18.6],
-            ["NM", 18.2],
-            ...
+            ["MS", 445231, 2261978, 19.69],
+            ["LA", 661879, 3556834, 18.61],
+            ["NM", 353087, 1944014, 18.16],
+            ["WV", 276482, 1611633, 17.15],
+            ["AR", 445329, 2714562, 16.41]
           ]
         }
+      }
+    },
+
+    // TYPE 3: "tool_result" — Internal tool execution details (we SKIP this)
+    {
+      "type": "tool_result",
+      "tool_result": {
+        "tool_name": "query_poverty",
+        "tool_input": "poverty rate by state top 5",
+        "content": [...]  // same data as "table" above, just wrapped differently
       }
     }
   ]
 }
+    </pre>
 
-// My code extracts:
-// response_text = "Mississippi has the highest poverty rate..."
-// tables = [{"title": "Poverty Rate by State", "columns": ["STATE","POVERTY_RATE_PCT"], "data": [[...]]}]
-// Renders: chat bubble for text + st.dataframe() for table
-  </pre>
+    <h4>Step 4: The Parsing Loop (Line by Line)</h4>
+    <pre>
+response_text = ""    # Will accumulate narrative text
+tables = []           # Will collect structured data tables
+
+for item in parsed.get("content", []):
+    item_type = item.get("type")
+
+    if item_type == "text":
+        # NARRATIVE: Agent's written answer
+        # Append to response_text (there might be multiple text blocks)
+        response_text += item.get("text", "")
+
+    elif item_type == "table":
+        # STRUCTURED DATA: SQL query results
+        table_data = item.get("table", {})
+        result_set = table_data.get("result_set", {})
+        title = table_data.get("title", "Results")        # e.g., "Top 5 States by Poverty Rate"
+        meta = result_set.get("resultSetMetaData", {})
+        rows = result_set.get("data", [])                  # [[row1], [row2], ...]
+        col_defs = meta.get("rowType", [])                 # [{"name":"STATE"}, {"name":"POVERTY_RATE_PCT"}]
+
+        if col_defs and rows:
+            # Extract column names from metadata
+            col_names = [c.get("name", f"col_{i}") for i, c in enumerate(col_defs)]
+            # Store as dict for later rendering with st.dataframe()
+            tables.append({"title": title, "columns": col_names, "data": rows})
+
+    elif item_type == "tool_result":
+        # SKIP: tool_result contains the same data that "table" already captured.
+        # Including it would show duplicate data to the user.
+        # The agent returns BOTH tool_result (internal) and table (user-facing).
+        pass
+
+if not response_text:
+    response_text = "No response received from the agent."
+
+return response_text, tables
+    </pre>
+
+    <h4>Step 5: How the UI Renders This</h4>
+    <pre>
+# In the main app (after call_agent returns):
+answer = "Here are the states with the highest poverty rates..."  # response_text
+tables = [{"title": "Top 5 States...", "columns": ["STATE",...], "data": [[...]]}]
+
+# Render the narrative as a chat bubble
+st.markdown(f'&lt;div class="chat-agent"&gt;{answer}&lt;/div&gt;', unsafe_allow_html=True)
+
+# Render each table as an interactive dataframe
+for tbl in tables:
+    st.caption(tbl["title"])                                  # "Top 5 States by Poverty Rate"
+    df = pd.DataFrame(tbl["data"], columns=tbl["columns"])    # Creates pandas DataFrame
+    st.dataframe(df, use_container_width=True)                # Interactive, sortable table
+    </pre>
+
+    <h4>Why tool_result is Skipped</h4>
+    <p>The agent response contains BOTH <code>"tool_result"</code> (the raw output from the Cortex Analyst tool call) AND <code>"table"</code> (the same data formatted for user display). If you process both, you show the same data twice. The <code>"table"</code> type is the clean, user-facing version with a title and proper metadata. The <code>"tool_result"</code> is the internal plumbing — useful for debugging but not for display.</p>
+
+    <h4>Edge Cases Handled</h4>
+    <table>
+      <thead><tr><th>Scenario</th><th>What Happens</th><th>User Sees</th></tr></thead>
+      <tbody>
+        <tr><td>Agent returns only text (no data query needed)</td><td>tables[] stays empty, response_text has the narrative</td><td>Chat bubble only, no table</td></tr>
+        <tr><td>Agent returns text + table (normal data query)</td><td>Both populated</td><td>Chat bubble + interactive dataframe below it</td></tr>
+        <tr><td>Agent returns multiple tables (multi-tool query)</td><td>tables[] gets multiple entries</td><td>Multiple dataframes stacked, each with caption</td></tr>
+        <tr><td>Agent returns empty response</td><td>response_text = "", triggers the fallback</td><td>"No response received from the agent."</td></tr>
+        <tr><td>Agent rejects question (guardrail)</td><td>Only text returned (rejection message), no table</td><td>Chat bubble with "I can only answer census questions..."</td></tr>
+      </tbody>
+    </table>
+  </div>
 
   <table>
     <thead><tr><th>Lines</th><th>Code Section</th><th>What It Does</th><th>Why</th></tr></thead>
