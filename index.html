@@ -1691,13 +1691,128 @@ keep agent/UI thin (easy to iterate), then tune based on REAL user behavior, not
     </pre>
   </div>
   <div class="card">
-    <ul>
-      <li><strong>Multi-tenancy via RBAC:</strong> Each tenant gets a role. Row access policies on views filter by TENANT_ID. Same agent, same views, different data visibility.</li>
-      <li><strong>Or: per-tenant deployment:</strong> Clone database per tenant. Agent spec becomes a Terraform template. CI/CD deploys N instances.</li>
-      <li><strong>Compute isolation:</strong> Cortex Agent is serverless (no warehouse to size). For SiS, route tenants to dedicated warehouses via session parameters.</li>
-      <li><strong>Customization per tenant:</strong> Override instructions/tool set per deployment. Some tenants may only need 5 of the 24 domains.</li>
-      <li><strong>Cost allocation:</strong> Snowflake resource monitors + budgets per tenant role. Track credit usage via ACCOUNT_USAGE views.</li>
-    </ul>
+    <h4>What is Multi-Tenancy?</h4>
+    <p><strong>Tenant</strong> = an independent customer/organization that uses the same application but must only see their own data. Multi-tenancy means serving 50 different organizations from a single deployment without any tenant seeing another's data.</p>
+    <p><strong>Census example:</strong> Imagine 50 state government agencies each use this agent, but Oregon's agency should only see Oregon data, California's should only see California data — same agent, same infrastructure, different data boundaries.</p>
+
+    <h4>Three Multi-Tenancy Approaches in Snowflake</h4>
+    <table>
+      <thead><tr><th>Approach</th><th>How It Works</th><th>Best For</th><th>Census Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Option A: Shared + Row Access Policies</strong></td><td>One database, one agent, one set of views. Row Access Policy filters data per tenant's role.</td><td>Low cost, many tenants, same schema, moderate isolation</td><td>All 50 states share the same views. RAP ensures Oregon only sees STATE='OR' rows.</td></tr>
+        <tr><td><strong>Option B: Database-per-Tenant (Zero-Copy Clone)</strong></td><td>Clone database for each tenant. Each gets their own agent + views + data.</td><td>Regulated industries, strong isolation, custom data per tenant</td><td>Each state agency gets a cloned DB with their state's data pre-filtered.</td></tr>
+        <tr><td><strong>Option C: Schema-per-Tenant</strong></td><td>One database, separate schema per tenant. Views/agent isolated per schema.</td><td>Moderate isolation, shared administration, tenant-specific SVs</td><td>CENSUS_DB.OREGON, CENSUS_DB.CALIFORNIA — each has their own views tuned to local needs.</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Option A Deep-Dive: RBAC + Row Access Policies (Recommended for This Use Case)</h4>
+    <pre>
+-- STEP 1: Create a role per tenant
+CREATE ROLE TENANT_OREGON;
+CREATE ROLE TENANT_CALIFORNIA;
+CREATE ROLE TENANT_TEXAS;
+
+-- STEP 2: Grant access to the shared objects
+GRANT USAGE ON DATABASE CENSUS_INTELLIGENCE_DB TO ROLE TENANT_OREGON;
+GRANT USAGE ON SCHEMA CENSUS_INTELLIGENCE_DB.PUBLIC TO ROLE TENANT_OREGON;
+GRANT SELECT ON ALL VIEWS IN SCHEMA CENSUS_INTELLIGENCE_DB.PUBLIC TO ROLE TENANT_OREGON;
+GRANT SELECT, REFERENCES ON ALL SEMANTIC VIEWS IN SCHEMA CENSUS_INTELLIGENCE_DB.PUBLIC TO ROLE TENANT_OREGON;
+-- (repeat for each tenant role)
+
+-- STEP 3: Create a mapping table (tenant → state filter)
+CREATE TABLE TENANT_STATE_MAPPING (
+    TENANT_ROLE VARCHAR,
+    ALLOWED_STATES ARRAY
+);
+INSERT INTO TENANT_STATE_MAPPING VALUES
+    ('TENANT_OREGON', ARRAY_CONSTRUCT('OR')),
+    ('TENANT_CALIFORNIA', ARRAY_CONSTRUCT('CA')),
+    ('TENANT_TEXAS', ARRAY_CONSTRUCT('TX'));
+-- Some tenants might see multiple states (regional agency):
+INSERT INTO TENANT_STATE_MAPPING VALUES
+    ('TENANT_SOUTHEAST', ARRAY_CONSTRUCT('FL', 'GA', 'AL', 'MS', 'LA', 'SC', 'NC'));
+
+-- STEP 4: Create Row Access Policy
+CREATE OR REPLACE ROW ACCESS POLICY tenant_state_filter
+AS (state_value VARCHAR) RETURNS BOOLEAN ->
+    CURRENT_ROLE() = 'SYSADMIN'  -- admins see everything
+    OR EXISTS (
+        SELECT 1 FROM TENANT_STATE_MAPPING
+        WHERE TENANT_ROLE = CURRENT_ROLE()
+          AND ARRAY_CONTAINS(state_value::VARIANT, ALLOWED_STATES)
+    );
+
+-- STEP 5: Apply RAP to every base view's STATE column
+ALTER VIEW V_POVERTY ADD ROW ACCESS POLICY tenant_state_filter ON (STATE);
+ALTER VIEW V_INCOME ADD ROW ACCESS POLICY tenant_state_filter ON (STATE);
+ALTER VIEW V_EDUCATION ADD ROW ACCESS POLICY tenant_state_filter ON (STATE);
+-- ... apply to all 24 views
+
+-- STEP 6: Create users and assign tenant roles
+CREATE USER oregon_analyst PASSWORD = '***' DEFAULT_ROLE = TENANT_OREGON;
+GRANT ROLE TENANT_OREGON TO USER oregon_analyst;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE TENANT_OREGON;
+    </pre>
+    <p><strong>Result:</strong> When Oregon's user asks "What is the poverty rate by state?", the agent calls the same semantic view, same SQL is generated, but the Row Access Policy silently filters to only STATE='OR' rows. They never see other states' data. <strong>Zero code changes to the agent or semantic views.</strong></p>
+
+    <h4>How the Agent Works in Multi-Tenant Mode</h4>
+    <pre>
+Oregon user asks: "What is the poverty rate by state?"
+  ↓
+Agent generates SQL (same as always):
+  SELECT state, ... FROM V_POVERTY WHERE ...
+  ↓
+Snowflake executes SQL → Row Access Policy fires automatically:
+  → Checks CURRENT_ROLE() = 'TENANT_OREGON'
+  → Looks up ALLOWED_STATES = ['OR']
+  → Filters all rows to STATE = 'OR' only
+  ↓
+Agent receives: only Oregon data
+Agent responds: "Oregon's poverty rate is 11.4%"
+  (never mentions other states because it literally can't see them)
+    </pre>
+
+    <h4>Option B: Database-per-Tenant (For Regulated Industries)</h4>
+    <pre>
+-- Zero-copy clone: instant, no additional storage cost until data diverges
+CREATE DATABASE CENSUS_OREGON CLONE CENSUS_INTELLIGENCE_DB;
+CREATE DATABASE CENSUS_CALIFORNIA CLONE CENSUS_INTELLIGENCE_DB;
+
+-- Each tenant gets their own agent (can customize instructions per tenant)
+CREATE CORTEX AGENT CENSUS_OREGON.PUBLIC.STATE_AGENT ...
+  -- Custom instructions: "You serve Oregon state government..."
+  -- Custom tool set: maybe only 10 of 24 domains relevant
+
+-- Advantages:
+--   Full isolation (compliance, HIPAA, FedRAMP)
+--   Custom agent behavior per tenant
+--   Independent upgrade schedule (test in one tenant before rolling to all)
+-- Disadvantages:
+--   50 databases to manage (Terraform templates help)
+--   50 agents to update when semantic views change
+--   Higher operational overhead
+    </pre>
+
+    <h4>Cost Allocation Across Tenants</h4>
+    <table>
+      <thead><tr><th>Cost Component</th><th>How to Track Per Tenant</th><th>Snowflake Feature</th></tr></thead>
+      <tbody>
+        <tr><td>Agent orchestration (tokens)</td><td>Tag each invocation with tenant role; query ACCOUNT_USAGE.CORTEX_USAGE_HISTORY</td><td>Resource monitors per role</td></tr>
+        <tr><td>Warehouse compute</td><td>Assign dedicated warehouse per tenant, or track via query tags</td><td>Resource monitors + WAREHOUSE_METERING_HISTORY</td></tr>
+        <tr><td>Storage</td><td>For Option B: per-database storage metrics. For Option A: shared (allocate evenly or by usage)</td><td>TABLE_STORAGE_METRICS</td></tr>
+        <tr><td>Budget enforcement</td><td>Set monthly credit budgets per tenant role; alert at 80%, suspend at 100%</td><td>Snowflake Budgets + Alerts</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Which Approach I'd Recommend</h4>
+    <table>
+      <thead><tr><th>Scenario</th><th>Recommended</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>50 tenants, same data model, low regulation</td><td><strong>Option A</strong> (Shared + RAP)</td><td>Lowest cost, simplest ops, one agent to maintain. RAP provides data isolation without duplication.</td></tr>
+        <tr><td>5-10 tenants, regulated (healthcare/finance), need full isolation</td><td><strong>Option B</strong> (Database clone)</td><td>Full isolation for compliance. Each tenant can be audited independently. Custom agent per tenant.</td></tr>
+        <tr><td>20 tenants, same model but different domain focus per tenant</td><td><strong>Option C</strong> (Schema per tenant)</td><td>Shared admin, but each tenant gets customized semantic views (e.g., healthcare agency only needs poverty + insurance views).</td></tr>
+      </tbody>
+    </table>
   </div>
 
   <h3>"What would it take to make this auditable for a regulated industry?"</h3>
